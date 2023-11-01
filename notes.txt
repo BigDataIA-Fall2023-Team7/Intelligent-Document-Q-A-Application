@@ -1,0 +1,15 @@
+# Testing Airflow pipeline 1
+# Use this config parameter json
+
+{
+    "inputPDFLinksArray": [
+        "https://www.sec.gov/files/formadv.pdf",
+        "https://www.sec.gov/files/forms-1.pdf"
+    ],
+    "pdfProcessor": "pypdf",
+    "nougatAPIServerURL": ""
+}
+
+
+# Install the dependencies on GCP Cloud Composer
+pip install apache-airflow==2.4.3 apache-airflow-providers-google mysql-connector-python pypdf apache-airflow-providers-microsoft-mssql pyodbc
