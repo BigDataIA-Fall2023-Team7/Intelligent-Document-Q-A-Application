@@ -1,0 +1,9 @@
+pyodbc
+python-jose
+PyJWT
+fastapi
+uvicorn[standard]
+pydantic
+azure-identity
+sqlalchemy
+python-multipart
