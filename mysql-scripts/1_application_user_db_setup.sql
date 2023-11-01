@@ -1,4 +1,4 @@
-#Use the mysql root user to create a database and application dba user/application user for it
+-- Use the mysql root user to create a database and application dba user/application user for it
 
 create database if not exists db_damg7245team7;
 use db_damg7245team7;
