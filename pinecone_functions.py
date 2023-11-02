@@ -41,7 +41,8 @@ class pinecone_func():
     def upsert(self,csv_filename):
         global pinecone
         article_df = pd.read_csv(csv_filename)
-        article_df.columns=["title","text","tokenCount","content_vector"]
+        article_df.columns=["text","tokenCount","title","vector_id","content_vector"]
+        # article_df.columns=["title","text","tokenCount","content_vector"]
         article_df['vector_id'] = article_df.index
         article_df['content_vector'] = article_df.content_vector.apply(literal_eval)
         article_df['vector_id'] = article_df['title'] + "_" + article_df['vector_id'].apply(str)
@@ -83,7 +84,10 @@ class pinecone_func():
         print("Deleted all records")
         
     def stats(self):
-        return self.curr_index.describe_index_stats()
+        try:
+            return self.curr_index.describe_index_stats()
+        except Exception as e:
+            print(e.body)
 
     def fetch_by_id(self,vector_ids:list):
         response = self.curr_index.fetch(vector_ids)
