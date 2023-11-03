@@ -17,7 +17,7 @@ class UserCredentialsResponse(BaseModel):
     user_email: str
     created_datetime: datetime
     updated_datetime: datetime
-    lastlogin_datetime: datetime | None
+    lastlogin_datetime: datetime
     active: bool
 
 class UserCredentialsCreate(BaseModel):
