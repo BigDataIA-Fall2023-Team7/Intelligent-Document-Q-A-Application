@@ -48,6 +48,11 @@ class ChatHistoryBase(BaseModel):
 class ChatHistoryCreate(ChatHistoryBase):
     pass
 
+class ChatHistoryCreate(BaseModel):
+    user_id: int
+    user_question: str
+    system_answer: str
+    created_datetime: datetime = datetime.utcnow()
 
 class ChatHistory(ChatHistoryBase):
     chat_id: int

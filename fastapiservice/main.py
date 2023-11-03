@@ -1,5 +1,5 @@
 from fastapi.responses import JSONResponse
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query, Form
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import NoResultFound
 from . import crud, models, schemas
@@ -12,10 +12,12 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from .models import VectorDatabaseStats
+from .QA_using_pinecone import get_answer
+from typing import List, Iterator
 
-models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+
 
 @app.get('/')
 def info():
@@ -90,3 +92,28 @@ def get_pinecone_forms(current_user: dict = Depends(get_current_user), db: Sessi
         .all()
     )
     return response_data
+
+
+@app.post("/askQuestion", response_model=schemas.ChatHistory)
+def ask_question(
+    question: str = Form(...),
+    form_titles: List[str] = Form(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_email = current_user["sub"]  # Extract user_email from the JWT token
+
+    try:
+        db_user = crud.get_user_credentials_by_email(db, user_email)
+    except NoResultFound:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_id = db_user.user_id  # Get the user_id from the database
+
+    answer = get_answer(question, form_titles)  # Retrieve the answer
+
+    # Store the question and answer in the ChatHistory table
+    chat_data = schemas.ChatHistoryCreate(user_id=user_id, user_question=question, system_answer=answer)
+    db_chat = crud.create_chat_history(db, chat_data)
+
+    return db_chat
