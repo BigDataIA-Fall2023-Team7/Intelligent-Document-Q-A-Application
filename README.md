@@ -30,7 +30,7 @@ This project aims to build an Intelligent Document Search and Retrieval System t
 
 ## Architecture 👷🏻‍♂️
 
-![alt text](architecture-diagram/images/architecture_for_q&a_chatbot_on_pdfs.png)
+![alt text](architecture-diagram/architecture_for_q&a_chatbot_on_pdfs.png)
 
 ## Project Workflow
 
