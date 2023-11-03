@@ -11,6 +11,7 @@ from .jwt_utils import create_access_token, verify_token
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from .models import VectorDatabaseStats
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -80,3 +81,12 @@ def show_reference(current_user: dict = Depends(get_current_user), db: Session =
         .all()
     )
     return reference_data
+
+@app.get("/pineconeForms",response_model=list[schemas.VectorDatabaseStatsItem])
+def get_pinecone_forms(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    response_data = (
+        db.query(models.VectorDatabaseStats)
+        .with_entities(models.VectorDatabaseStats.form_name, models.VectorDatabaseStats.recent_activity)
+        .all()
+    )
+    return response_data

@@ -59,3 +59,7 @@ class ReferenceItem(BaseModel):
     id: int
     form_title: str
     created_datetime: datetime
+
+class VectorDatabaseStatsItem(BaseModel):
+    form_name: str
+    recent_activity: datetime
