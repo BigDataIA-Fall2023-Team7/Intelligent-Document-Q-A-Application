@@ -103,6 +103,155 @@ def chunkCreator(pyPDFMMDContents, concatChunkDelimiter):
 
     return (pyPDFChunkDF, oversized_chunks)
 
+def nougatChunkCreator(formname, nougatMMDContents):
+    print("Chunking Nougat MMD")
+    semantics_df_rows = []
+    semantics_df_headers = ["FormName", "ParaNumber", "ParaContent", "ParaCharacterCount", "ParaSemantics", "Section", "TokenCount", "CummulativeTokenCount"]
+    mmdFileContents = nougatMMDContents
+    
+    print('Cleaning MMD Contents')
+
+    #Cleaning Tables and Warnings in MMD File
+
+    #Cleaning Tables
+    pattern = r'\\begin{tabular}.*?\n'
+    print(f"Tables Identified : {len(re.findall(pattern, mmdFileContents))}")
+    mmdFileContents = re.sub(pattern, '\n',mmdFileContents)
+
+    pattern = r'\\end{tabular}.*?\n'
+    mmdFileContents = re.sub(pattern, '\n',mmdFileContents)
+
+    pattern = r'\\begin{table}.*?\n'
+    print(f"Tables Identified : {len(re.findall(pattern, mmdFileContents))}")
+    mmdFileContents = re.sub(pattern, '\n',mmdFileContents)
+
+    pattern = r'\\end{table}.*?\n'
+    mmdFileContents = re.sub(pattern, '\n',mmdFileContents)
+
+    #Cleaning Warnings
+    pattern = r'\+\+\+(.*?)\+\+\+'
+    print(f"Warnings Identified : {len(re.findall(pattern, mmdFileContents, re.DOTALL))}")
+    mmdFileContents = re.sub(pattern, '\n',mmdFileContents,flags=re.DOTALL)
+
+    listOfParagraphs = mmdFileContents.split("\n")
+
+    listOfParagraphsAfterCleaning = []
+    cummulativetokencount = 0
+    for i, paragraph in enumerate(listOfParagraphs):
+        if len(paragraph)!=0:
+            listOfParagraphsAfterCleaning.append(paragraph)
+
+            #TokenCount for each row in semantics_df
+            tokencount = num_tokens(paragraph, GPT_MODEL)
+            cummulativetokencount+=tokencount
+
+            #Compute ParaSemantics in semantics_df
+            #["FormName", "ParaNumber", "ParaContent", "ParaCharacterCount", "ParaSemantics"]
+            
+            if paragraph.startswith("###"):
+                parasemantics = "Heading3"
+            elif paragraph.startswith("##"):
+                parasemantics = "Heading2"
+            elif paragraph.startswith("#"):
+                parasemantics = "Heading1"
+            elif paragraph.startswith("**"):
+                parasemantics = "Bold"
+            elif paragraph.startswith("*"):
+                parasemantics = "Bullet"
+            else:
+                parasemantics = "Paragraph"
+            semantics_df_rows.append([formname, i, paragraph, len(paragraph), parasemantics, None, tokencount, cummulativetokencount])
+
+
+    semantics_df = pd.DataFrame(data=semantics_df_rows, columns=semantics_df_headers)
+    currentsectionnumber = 0
+    firstheading = False
+
+    for index, row in semantics_df.iterrows():
+        if (row['ParaSemantics'] not in ["Heading3", "Heading2", "Heading1"]) and (firstheading!=True):
+            currentsectionnumber+=1
+            semantics_df.iloc[index, semantics_df.columns.get_loc('Section')] = currentsectionnumber
+        elif (firstheading==True) and (row['ParaSemantics'] not in ["Heading3", "Heading2", "Heading1"]):
+                semantics_df.iloc[index, semantics_df.columns.get_loc('Section')] = currentsectionnumber
+        else:
+            firstheading = True
+            currentsectionnumber+=1
+            semantics_df.iloc[index, semantics_df.columns.get_loc('Section')] = currentsectionnumber
+    
+    semantics_df.to_csv(FILE_CACHE + f"{formname}_semantics_df.csv", index=False, header=True)
+    print("Generated Semantics File in FILE_CACHE")
+
+    section_df = semantics_df.groupby('Section')['ParaContent'].agg('\n'.join).reset_index()
+    section_df.rename(columns={'ParaContent': 'Chunk'}, inplace=True)
+    section_df['TokenCount'] = section_df['Chunk'].apply(num_tokens, args=(GPT_MODEL,))
+    section_df['CummulativeTokenCount'] = section_df['TokenCount'].cumsum()
+    section_df.to_csv(FILE_CACHE + f"{formname}_sections_df.csv", index=False, header=True)
+
+    chunk_df_rows = []
+    chunk_df_headers = ["Chunk", "TokenCount", "CummulativeTokenCount"]
+    oversized_sections = []
+
+    current_chunk_buffer = ""
+    current_chunk_buffer_tokens=0
+    for i, row in section_df.iterrows():
+        if row['TokenCount'] > TOKEN_LIMIT:
+            oversized_sections.append(row['Chunk'])
+            if current_chunk_buffer!="":
+                chunk_df_rows.append([current_chunk_buffer, None, None])
+                current_chunk_buffer=""
+
+        elif row['TokenCount'] + current_chunk_buffer_tokens < TOKEN_LIMIT:
+            current_chunk_buffer = current_chunk_buffer + "\n" + row['Chunk']
+        else:
+            chunk_df_rows.append([current_chunk_buffer, None, None])
+            current_chunk_buffer = row['Chunk']
+        current_chunk_buffer_tokens = num_tokens(current_chunk_buffer,GPT_MODEL)
+        
+    if current_chunk_buffer!="":
+        chunk_df_rows.append([current_chunk_buffer, None, None])
+
+    chunk_df = pd.DataFrame(data=chunk_df_rows, columns=chunk_df_headers)
+    chunk_df['TokenCount']=chunk_df["Chunk"].apply(num_tokens, args=(GPT_MODEL,))
+
+    print("Generated Initial Chunk File in FILE_CACHE")
+
+    if len(oversized_sections)!=0:
+        for oversized_section in oversized_sections:
+            common_shared_heading = ""
+            oversizedDf_headers = ["Sentence", "TokenCount", "CummulativeTokenCount"]
+            pattern = r'(.*?)\n'
+            sentences = re.split(pattern, oversized_section)
+            oversizedDf_rows = [[s.strip(), num_tokens(s.strip(), GPT_MODEL), None] for s in sentences if s.strip()]
+            oversizedDf = pd.DataFrame(data=oversizedDf_rows, columns=oversizedDf_headers)
+            if oversizedDf.iloc[0]['Sentence'].startswith('#'):
+                common_shared_heading = oversizedDf.iloc[0]['Sentence']
+                oversizedDf = oversizedDf.drop(0)
+
+            oversizedDf_rows = []
+            current_chunk_buffer = common_shared_heading
+            current_chunk_buffer_tokens=0
+            for i, row in oversizedDf.iterrows():
+                if row['TokenCount'] + current_chunk_buffer_tokens < TOKEN_LIMIT:
+                    current_chunk_buffer = current_chunk_buffer + '\n' + row["Sentence"]
+                else:
+                    oversizedDf_rows.append([current_chunk_buffer, None, None])
+                    current_chunk_buffer = common_shared_heading + row['Sentence']
+
+                current_chunk_buffer_tokens = num_tokens(current_chunk_buffer,GPT_MODEL)
+
+            if current_chunk_buffer!="":
+                oversizedDf_rows.append([current_chunk_buffer, None, None])
+            
+            tempDf = pd.DataFrame(data=oversizedDf_rows, columns=["Chunk", "TokenCount", "CummulativeTokenCount"])
+            tempDf['TokenCount'] = tempDf['Chunk'].apply(num_tokens, args=(GPT_MODEL,))
+            chunk_df = pd.concat([chunk_df, tempDf], ignore_index=True)
+            print("Updated Chunk File for oversized sections in FILE_CACHE")
+
+    
+    chunk_df = chunk_df.rename(columns={'Chunk': 'Content'})
+    print("Chunking Complete")
+    return chunk_df[['Content', 'TokenCount']]
+
 def get_embeddings(context):
     try:
         response = openai.Embedding.create(model=EMBEDDING_MODEL, input=context)
@@ -110,8 +259,6 @@ def get_embeddings(context):
     except Exception as e:
         print(e)
         return ""
-
-
 
 
 # Global Variables
@@ -323,8 +470,108 @@ def task_selectPDFProcessor(**context):
     
 def task_processPDFViaNougat(**context):
     ti = context['ti']
+    gcsSavedPDFLocations = context['ti'].xcom_pull(key='gcsSavedPDFLocations')
     APPLICATION_LOG_CORRELATION_ID = ti.xcom_pull(key='APPLICATION_LOG_CORRELATION_ID')
-    pass
+    nougatAPIServerURL = context["params"]["nougatAPIServerURL"].strip()
+
+    gcs_bucket = GCS_BUCKET
+    gcs_prefix = APPLICATION_LOG_CORRELATION_ID + "/pdfs/"
+    log_details =  f'Redownloading PDFs from {gcs_bucket}/{gcs_prefix} to process using Nougat'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    # Redownload the PDFs from GCS to FILECACHE for Nougat Processing
+    # Download each PDF one by one and process using Nougat to get MMD file
+    # Send that MMD file from FILECACHE to GCS
+    gcsSavedMMDLocations = []
+    for i, gcsObject in enumerate(gcsSavedPDFLocations):
+        a = gcsObject.split('/')
+        filename = a[0] + '_' + a[2]
+        download_file = GCSToLocalFilesystemOperator(
+            task_id=f"download_file_{filename}",
+            object_name=gcsObject,
+            bucket=gcs_bucket,
+            filename=FILE_CACHE + filename
+        )
+        download_file.execute(context=context)
+        log_details =  f'Redownloaded file {gcs_bucket}/{gcsObject} to process using Nougat'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+        with open(FILE_CACHE + filename, 'rb') as f:
+            pdfFile = f.read()
+        
+        nougatAPIHeaders = { "Accept":"application/json"}
+        nougatAPIInputPDF = {'file':pdfFile}
+
+        log_details = f"Sending valid downloaded PDF to NougatAPIServerURL: {filename}"
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+
+        response = requests.post(nougatAPIServerURL + "/predict", headers=nougatAPIHeaders, files=nougatAPIInputPDF)
+        if response.status_code == 200: 
+            mmdContentsFromNougatAPI = response.content[1:-1].decode().replace(r"\n\n",'\n\n').replace(r"\n",'\n').replace('\\\\', '\\')   
+            log_details = f"Nougat Processing complete successfully: {filename}"
+            print(log_details)
+            applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+        elif response.status_code == 404:
+            log_details = f"Check if Nougat API server is accessible via the Nougat API URL: {filename}"
+            print(log_details)
+            applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Error', log_details=log_details)
+            raise Exception("Check if Nougat API server is accessible via the Nougat API URL")
+        elif response.status_code == 422:
+            log_details = f"Please provide a PDF to Nougat API server: {filename}"
+            print(log_details)
+            applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Error', log_details=log_details)
+            raise Exception("Please provide a PDF to Nougat API server")
+            #raise(CustomException(message="PDF Missing", details={'status':'400', 'message':"Please provide a PDF to Nougat API server",'referenceLink':self.inputPDFLink})) 
+        elif response.status_code == 502:
+            log_details = f"Check if Nougat API server is running: {filename}"
+            print(log_details)
+            applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Error', log_details=log_details)
+            raise Exception("Check if Nougat API server is running")
+
+        mmdFileName = f'{FILE_CACHE + a[2]}'[:-3] + "mmd"
+        with open(mmdFileName, 'w') as file:
+            file.write(mmdContentsFromNougatAPI)
+
+        #Send the processed MMD to GCS
+        
+        gcs_bucket = GCS_BUCKET
+        gcs_prefix = APPLICATION_LOG_CORRELATION_ID + "/nougat-mmds"
+        log_details =  f'Using {gcs_bucket} to upload the processed Nougat MMDs'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+        filename = mmdFileName.split('/')[-1]
+        gcs_object_name = f"{gcs_prefix}/{filename}"
+        upload_task = LocalFilesystemToGCSOperator(
+                task_id=f'{filename}',
+                src=mmdFileName,
+                dst=gcs_object_name,
+                bucket=gcs_bucket,
+                mime_type="application/octet-stream",
+                gcp_conn_id="google_cloud_default",
+                dag=dag,
+        )
+        upload_task.execute(context=context)
+        gcsSavedMMDLocations.append(gcs_object_name)
+        log_details =  f'Uploaded {filename} to {gcs_object_name}'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    
+    log_details =  f'Uploaded All MMDs to {gcs_bucket}/{gcs_prefix}'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+
+    log_details =  f'Nougat Processed all PDFs'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    context['ti'].xcom_push(key='gcsSavedMMDLocations', value=gcsSavedMMDLocations)
 
 def task_processPDFViaPyPDF(**context):
     ti = context['ti']
@@ -506,7 +753,98 @@ def task_chunkingForPyPDF_MMDs(**context):
     context['ti'].xcom_push(key='gcsSavedCombinedChunkLocation', value=gcs_object_name)
 
 def task_chunkingForNougat_MMDs(**context):
-    pass
+    ti = context['ti']
+    gcsSavedMMDLocations = context['ti'].xcom_pull(key='gcsSavedMMDLocations')
+    APPLICATION_LOG_CORRELATION_ID = ti.xcom_pull(key='APPLICATION_LOG_CORRELATION_ID')
+
+    combinedNougatChunkDF = pd.DataFrame(columns=['Content', 'TokenCount', 'FormName', 'ChunkId'])
+
+    gcs_bucket = GCS_BUCKET
+    gcs_prefix = APPLICATION_LOG_CORRELATION_ID + "/nougat-mmds/"
+    log_details =  f'Redownloading Nougat MMDs from {gcs_bucket}/{gcs_prefix} for chunking'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    # Redownload the MMDs from GCS to FILECACHE for Chunking based on Nougat MMDs
+    # Download each MMD one by one and chunk to get Chunk.csv
+    # Send that Chunk.csv file from FILECACHE to GCS
+    gcsSavedNougatChunkLocations = []
+    for i, gcsObject in enumerate(gcsSavedMMDLocations):
+        a = gcsObject.split('/')
+        filename = a[0] + "_" + a[2]
+        formName = a[2][:-4]
+        download_file = GCSToLocalFilesystemOperator(
+            task_id=f"download_file_{filename}",
+            object_name=gcsObject,
+            bucket=gcs_bucket,
+            filename=FILE_CACHE + filename
+        )
+        download_file.execute(context=context)
+        log_details =  f'Redownloaded file {gcs_bucket}/{gcsObject} to process using Nougat'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+
+        with open(FILE_CACHE + filename, 'r') as f:
+            nougatMMDContents = f.read()
+
+        chunkFileName = formName + "_chunk.csv"
+        nougatChunkDF = nougatChunkCreator(formName, nougatMMDContents)
+        nougatChunkDF['FormName'] = formName
+        nougatChunkDF['ChunkId'] = nougatChunkDF['FormName'] + '_' +nougatChunkDF.index.astype(str)
+        nougatChunkDF.to_csv(FILE_CACHE + chunkFileName, index=False, header=True)
+        combinedNougatChunkDF = pd.concat([combinedNougatChunkDF, nougatChunkDF])
+
+
+        gcs_bucket = GCS_BUCKET
+        gcs_prefix = APPLICATION_LOG_CORRELATION_ID + "/nougat-chunks"
+        gcs_object_name = f"{gcs_prefix}/{chunkFileName}"
+        upload_task = LocalFilesystemToGCSOperator(
+                task_id=f'{chunkFileName}',
+                src=FILE_CACHE + chunkFileName,
+                dst=gcs_object_name,
+                bucket=gcs_bucket,
+                mime_type="application/octet-stream",
+                gcp_conn_id="google_cloud_default",
+                dag=dag,
+        )
+        upload_task.execute(context=context)
+        gcsSavedNougatChunkLocations.append(gcs_object_name)
+        log_details =  f'Uploaded {chunkFileName} to {gcs_object_name}'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    
+    log_details =  f'Uploaded All Nougat Chunk Files to {gcs_bucket}/{gcs_prefix}'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    combinedNougatChunkFileName = f'{APPLICATION_LOG_CORRELATION_ID}_CombinedChunk.csv'
+    combinedNougatChunkDF.to_csv(FILE_CACHE + combinedNougatChunkFileName, index=False, header=True)
+    gcs_bucket = GCS_BUCKET
+    gcs_prefix = APPLICATION_LOG_CORRELATION_ID
+    gcs_object_name = f"{gcs_prefix}/{combinedNougatChunkFileName}"
+    upload_task = LocalFilesystemToGCSOperator(
+            task_id=combinedNougatChunkFileName,
+            src=FILE_CACHE + combinedNougatChunkFileName,
+            dst=gcs_object_name,
+            bucket=gcs_bucket,
+            mime_type="application/octet-stream",
+            gcp_conn_id="google_cloud_default",
+            dag=dag,
+    )
+    upload_task.execute(context=context)
+    log_details =  f'Uploaded {combinedNougatChunkFileName} to {gcs_bucket}'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+
+    log_details =  f'Nougat Chunking Complete for all Nougat MMDs'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    context['ti'].xcom_push(key='gcsSavedCombinedChunkLocation', value=gcs_object_name)
+
 
 def task_generateEmbeddingsForChunkFile(**context):
     ti = context['ti']
