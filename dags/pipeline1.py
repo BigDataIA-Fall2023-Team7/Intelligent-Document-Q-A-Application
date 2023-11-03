@@ -1,3 +1,4 @@
+import time
 from airflow import DAG
 from airflow.utils.dates import days_ago
 from airflow.operators.python import PythonOperator
@@ -17,6 +18,10 @@ import secrets
 import string
 import io
 import pypdf
+import tiktoken
+import openai
+
+
 
 from airflow.providers.google.cloud.operators.gcs import (
     GCSCreateBucketOperator,
@@ -27,11 +32,15 @@ from airflow.providers.google.cloud.operators.gcs import (
 
 from airflow.providers.google.cloud.transfers.local_to_gcs import LocalFilesystemToGCSOperator
 from airflow.providers.google.cloud.transfers.gcs_to_local import GCSToLocalFilesystemOperator
+from airflow.providers.google.cloud.operators.gcs import GCSObjectCreateAclEntryOperator 
 
 
-# To solve the stuck requests problem
-from _scproxy import _get_proxy_settings
-_get_proxy_settings()
+# To solve the stuck requests problem on MacOS while developing
+try:
+    from _scproxy import _get_proxy_settings
+    _get_proxy_settings()
+except:
+    pass
 
 
 
@@ -44,6 +53,10 @@ MYSQL_USER = Variable.get("airflow_var_mysqluser")
 MYSQL_PASSWORD = Variable.get("airflow_var_mysqlpassword")
 MYSQL_DATABASE = Variable.get("airflow_var_mysqldatabase")
 GCS_BUCKET = Variable.get("airflow_var_gcsbucket")
+TOKEN_LIMIT = int(Variable.get("airflow_var_token_limit"))
+GPT_MODEL = Variable.get("airflow_var_token_gpt_model")
+EMBEDDING_MODEL = Variable.get("airflow_var_embedding_model")
+openai.api_key = Variable.get("airflow_var_openai_api_key")
 
 
 # Utility Functions
@@ -51,6 +64,55 @@ def generate_random_string(length=6):
     characters = string.ascii_letters + string.digits
     random_string = ''.join(secrets.choice(characters) for _ in range(length))
     return random_string
+
+
+def num_tokens(text: str, model: str = GPT_MODEL) -> int:
+    """Return the number of tokens in a string."""
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
+
+
+def chunkCreator(pyPDFMMDContents, concatChunkDelimiter):
+    oversized_chunks = []
+    chunks = []
+    current_chunk_buffer=""
+    for line in pyPDFMMDContents:
+        i = line.strip() 
+        if i=='':
+            continue
+        else:
+
+            if num_tokens(i)>TOKEN_LIMIT:
+                oversized_chunks.append(i)
+                if current_chunk_buffer!="":
+                    chunks.append(current_chunk_buffer)
+                    current_chunk_buffer=""
+            
+            elif num_tokens(current_chunk_buffer+i) < TOKEN_LIMIT:
+                current_chunk_buffer = current_chunk_buffer + concatChunkDelimiter + i
+            
+            else:
+                chunks.append(current_chunk_buffer)
+                current_chunk_buffer = i
+
+    if current_chunk_buffer!="":
+        chunks.append(current_chunk_buffer)
+
+    pyPDFChunkDF = pd.DataFrame(data=chunks, columns=['Content'])
+    pyPDFChunkDF['TokenCount'] = pyPDFChunkDF['Content'].apply(lambda x: num_tokens(x))
+
+    return (pyPDFChunkDF, oversized_chunks)
+
+def get_embeddings(context):
+    try:
+        response = openai.Embedding.create(model=EMBEDDING_MODEL, input=context)
+        return response["data"][0]["embedding"]
+    except Exception as e:
+        print(e)
+        return ""
+
+
+
 
 # Global Variables
 PIPELINE_NAME='pipeline1'
@@ -103,21 +165,19 @@ def task_inititatePipeline(**context):
 
     print(f'Application Log Correlation ID : {APPLICATION_LOG_CORRELATION_ID}')
     inputPDFLinksArray = context["params"]["inputPDFLinksArray"]
-    pdfProcessor = context["params"]["pdfProcessor"]
     nougatAPIServerURL = context["params"]["nougatAPIServerURL"]
     print(f'Initiating the pipeline {PIPELINE_NAME}')
     print("Inputs")
     print(f'Input Configuration Param: inputPDFLinksArray -> {inputPDFLinksArray}')
-    print(f'Input Configuration Param: pdfProcessor -> {pdfProcessor}')
+    print(f'Input Configuration Param: pdfProcessor -> {PDF_PROCESSOR}')
     print(f'Input Configuration Param: nougatAPIServerURL -> {nougatAPIServerURL}')
 
-    if PDF_PROCESSOR == "nougat" or PDF_PROCESSOR == "pypdf":
-        pass
-    else:
-        raise Exception("*** Incorrect PDF Processor (Only 'nougat' or 'pypdf' allowed ) ***")
+    if PDF_PROCESSOR == "nougat":
+        if nougatAPIServerURL is None:
+            raise Exception("*** nougatAPIServerURL expected when selecting nougat pdfProcessorr ***")
     
     print('Testing the connectivity to MySQL database')
-    log_details = f'Started the pipeline {PIPELINE_NAME} with inputPDFLinksArray->{inputPDFLinksArray} & pdfProcessor->{pdfProcessor}'
+    log_details = f'Started the pipeline {PIPELINE_NAME} with inputPDFLinksArray->{inputPDFLinksArray} & pdfProcessor->{PDF_PROCESSOR}'
     applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
     
 
@@ -249,8 +309,14 @@ def task_selectPDFProcessor(**context):
 
     pdfProcessor = ti.xcom_pull(key='PDF_PROCESSOR')
     if pdfProcessor == 'nougat':
+        log_details =  f'Selecting {pdfProcessor} for processing PDFs'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
         return 'task_processPDFViaNougat'
     elif pdfProcessor == 'pypdf':
+        log_details =  f'Selecting {pdfProcessor} for processing PDFs'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
         return 'task_processPDFViaPyPDF'
     else:
         raise Exception("*** Selecting PDF Processor Branch Failed ***")
@@ -276,7 +342,8 @@ def task_processPDFViaPyPDF(**context):
     # Send that MMD file from FILECACHE to GCS
     gcsSavedMMDLocations = []
     for i, gcsObject in enumerate(gcsSavedPDFLocations):
-        filename = gcsObject.replace('/', '_')
+        a = gcsObject.split('/')
+        filename = a[0] + '_' + a[2]
         download_file = GCSToLocalFilesystemOperator(
             task_id=f"download_file_{filename}",
             object_name=gcsObject,
@@ -293,7 +360,7 @@ def task_processPDFViaPyPDF(**context):
             pages = pdf_reader.pages[:]
             contents = "".join([page.extract_text() for page in pages])
 
-        mmdFileName = f'{FILE_CACHE + filename}'[:-3] + "mmd"
+        mmdFileName = f'{FILE_CACHE + a[2]}'[:-3] + "mmd"
         with open(mmdFileName, 'w') as file:
             file.write(contents)
 
@@ -322,18 +389,189 @@ def task_processPDFViaPyPDF(**context):
         print(log_details)
         applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
 
-    context['ti'].xcom_push(key='gcsSavedMMDLocations', value=gcsSavedMMDLocations)
+    
     log_details =  f'Uploaded All MMDs to {gcs_bucket}/{gcs_prefix}'
     print(log_details)
     applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
 
 
-    log_details =  f'PyPDF Processed all PDFs from {gcs_bucket}/{gcs_prefix}'
+    log_details =  f'PyPDF Processed all PDFs'
     print(log_details)
     applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
 
+    context['ti'].xcom_push(key='gcsSavedMMDLocations', value=gcsSavedMMDLocations)
     
 
+def task_chunkingForPyPDF_MMDs(**context):
+    ti = context['ti']
+    gcsSavedMMDLocations = context['ti'].xcom_pull(key='gcsSavedMMDLocations')
+    APPLICATION_LOG_CORRELATION_ID = ti.xcom_pull(key='APPLICATION_LOG_CORRELATION_ID')
+
+    combinedPyPDFChunkDF = pd.DataFrame(columns=['Content', 'TokenCount', 'FormName', 'ChunkId'])
+
+    gcs_bucket = GCS_BUCKET
+    gcs_prefix = APPLICATION_LOG_CORRELATION_ID + "/pypdf-mmds/"
+    log_details =  f'Redownloading PyPDF MMDs from {gcs_bucket}/{gcs_prefix} for chunking'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    # Redownload the MMDs from GCS to FILECACHE for Chunking based on PyPDF MMDs
+    # Download each MMD one by one and chunk to get Chunk.csv
+    # Send that Chunk.csv file from FILECACHE to GCS
+    gcsSavedPyPDFChunkLocations = []
+    for i, gcsObject in enumerate(gcsSavedMMDLocations):
+        a = gcsObject.split('/')
+        filename = a[0] + "_" + a[2]
+        formName = a[2][:-4]
+        download_file = GCSToLocalFilesystemOperator(
+            task_id=f"download_file_{filename}",
+            object_name=gcsObject,
+            bucket=gcs_bucket,
+            filename=FILE_CACHE + filename
+        )
+        download_file.execute(context=context)
+        log_details =  f'Redownloaded file {gcs_bucket}/{gcsObject} to process using PyPDF'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+        with open(FILE_CACHE + filename, 'r') as f:
+            pyPDFMMDContents = f.readlines()
+
+        chunkFileName = formName + "_chunk.csv"
+        pyPDFChunkDF = pd.DataFrame(columns=['Content', 'TokenCount'])
+        firstIterationChunks, oversizedLines = chunkCreator(pyPDFMMDContents, '\n')
+        pyPDFChunkDF = pd.concat([pyPDFChunkDF, firstIterationChunks])
+
+        if len(oversizedLines)>0:
+            list_of_words_by_line = [line.strip().split() for line in oversizedLines]
+            flat_list_of_words = [word for line in list_of_words_by_line for word in line]
+
+            secondIterationChunks, oversizedWords = chunkCreator(flat_list_of_words, ' ')
+            pyPDFChunkDF = pd.concat([pyPDFChunkDF, secondIterationChunks])
+
+        pyPDFChunkDF['FormName'] = formName
+        pyPDFChunkDF['ChunkId'] = pyPDFChunkDF['FormName'] + '_' +pyPDFChunkDF.index.astype(str)
+        pyPDFChunkDF.to_csv(FILE_CACHE + chunkFileName, index=False, header=True)
+
+        combinedPyPDFChunkDF = pd.concat([combinedPyPDFChunkDF, pyPDFChunkDF])
+
+        gcs_bucket = GCS_BUCKET
+        gcs_prefix = APPLICATION_LOG_CORRELATION_ID + "/pypdf-chunks"
+        gcs_object_name = f"{gcs_prefix}/{chunkFileName}"
+        upload_task = LocalFilesystemToGCSOperator(
+                task_id=f'{chunkFileName}',
+                src=FILE_CACHE + chunkFileName,
+                dst=gcs_object_name,
+                bucket=gcs_bucket,
+                mime_type="application/octet-stream",
+                gcp_conn_id="google_cloud_default",
+                dag=dag,
+        )
+        upload_task.execute(context=context)
+        gcsSavedPyPDFChunkLocations.append(gcs_object_name)
+        log_details =  f'Uploaded {chunkFileName} to {gcs_object_name}'
+        print(log_details)
+        applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    
+    log_details =  f'Uploaded All PyPDF Chunk Files to {gcs_bucket}/{gcs_prefix}'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    combinedPyPDFChunkFileName = f'{APPLICATION_LOG_CORRELATION_ID}_CombinedChunk.csv'
+    combinedPyPDFChunkDF.to_csv(FILE_CACHE + combinedPyPDFChunkFileName, index=False, header=True)
+    gcs_bucket = GCS_BUCKET
+    gcs_prefix = APPLICATION_LOG_CORRELATION_ID
+    gcs_object_name = f"{gcs_prefix}/{combinedPyPDFChunkFileName}"
+    upload_task = LocalFilesystemToGCSOperator(
+            task_id=combinedPyPDFChunkFileName,
+            src=FILE_CACHE + combinedPyPDFChunkFileName,
+            dst=gcs_object_name,
+            bucket=gcs_bucket,
+            mime_type="application/octet-stream",
+            gcp_conn_id="google_cloud_default",
+            dag=dag,
+    )
+    upload_task.execute(context=context)
+    gcsSavedPyPDFChunkLocations.append(gcs_object_name)
+    log_details =  f'Uploaded {combinedPyPDFChunkFileName} to {gcs_bucket}'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+
+    log_details =  f'PyPDF Chunking Complete for all PyPDF MMDs'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    context['ti'].xcom_push(key='gcsSavedCombinedChunkLocation', value=gcs_object_name)
+
+def task_chunkingForNougat_MMDs(**context):
+    pass
+
+def task_generateEmbeddingsForChunkFile(**context):
+    ti = context['ti']
+    gcsSavedCombinedChunkLocation = context['ti'].xcom_pull(key='gcsSavedCombinedChunkLocation')
+    APPLICATION_LOG_CORRELATION_ID = ti.xcom_pull(key='APPLICATION_LOG_CORRELATION_ID')
+
+    CombinedChunkFileName = gcsSavedCombinedChunkLocation.split('/')[0] + "_" + gcsSavedCombinedChunkLocation.split('/')[1]
+    ChunkEmbeddingFileName = gcsSavedCombinedChunkLocation.split('/')[0] + "_" + "ChunkEmbeddings.csv"
+
+    gcs_bucket = GCS_BUCKET
+    gcs_object_name = f"{gcsSavedCombinedChunkLocation}"
+    download_file = GCSToLocalFilesystemOperator(
+            task_id=f"{CombinedChunkFileName}",
+            object_name=gcs_object_name,
+            bucket=gcs_bucket,
+            filename=FILE_CACHE + CombinedChunkFileName
+        )
+    download_file.execute(context=context)
+    log_details =  f'Redownloaded file {gcs_bucket}/{gcs_object_name} to generate embeddings'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    combinedChunksDF = pd.read_csv(FILE_CACHE + CombinedChunkFileName)
+    count = 0
+    combinedChunksDF['Embeddings'] = None
+    for i, row in combinedChunksDF.iterrows():
+        combinedChunksDF.at[i, 'Embeddings'] = get_embeddings(row['Content'])
+        if count == 2:
+            time.sleep(65)
+            count=0
+        else:
+            count+=1
+    
+    combinedChunksDF.to_csv(f"{FILE_CACHE + ChunkEmbeddingFileName}", index=False, header=True)
+
+    gcs_bucket = GCS_BUCKET
+    gcs_prefix = APPLICATION_LOG_CORRELATION_ID
+    gcs_object_name = f"{gcs_prefix}/{ChunkEmbeddingFileName}"
+    upload_task = LocalFilesystemToGCSOperator(
+            task_id=ChunkEmbeddingFileName,
+            src=FILE_CACHE + ChunkEmbeddingFileName,
+            dst=gcs_object_name,
+            bucket=gcs_bucket,
+            mime_type="application/octet-stream",
+            gcp_conn_id="google_cloud_default",
+            dag=dag,
+    )
+    upload_task.execute(context=context)
+
+    gcs_object_create_acl_entry_task = GCSObjectCreateAclEntryOperator(
+        bucket=gcs_bucket,
+        object_name=gcs_object_name,
+        entity='allUsers',
+        role='READER',
+        task_id="gcs_object_create_acl_entry_task"
+    )
+    gcs_object_create_acl_entry_task.execute(context=context)
+
+    log_details =  f'Uploaded {ChunkEmbeddingFileName} to {gcs_bucket}'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
+
+    log_details =  f'Embedding generation Complete for {CombinedChunkFileName}'
+    print(log_details)
+    applicationLogger(applicationlog_correlationid=APPLICATION_LOG_CORRELATION_ID, application_component=PIPELINE_NAME, log_status='Info', log_details=log_details)
 
 
 
@@ -344,8 +582,8 @@ with DAG(
     schedule_interval=None,
     params={
     "inputPDFLinksArray": Param(["https://www.sec.gov/files/formadv.pdf", "https://www.sec.gov/files/forms-1.pdf"], type="array"),
-    "pdfProcessor": Param("pypdf", type="string"),
-    "nougatAPIServerURL": Param("", type="string"),
+    "pdfProcessor": Param("pypdf", enum=["pypdf", "nougat"]),
+    "nougatAPIServerURL": Param("", type=["null", "string"]),
     },
 ) as dag:
 
@@ -380,8 +618,29 @@ with DAG(
         python_callable=task_processPDFViaPyPDF
     )
 
+    task_chunkingForNougat_MMDs = PythonOperator(
+        task_id='task_chunkingForNougat_MMDs',
+        python_callable=task_chunkingForNougat_MMDs
+    )
+
+    task_chunkingForPyPDF_MMDs = PythonOperator(
+        task_id='task_chunkingForPyPDF_MMDs',
+        python_callable=task_chunkingForPyPDF_MMDs
+    )
+
+    task_generateEmbeddingsForChunkFile = PythonOperator(
+        task_id='task_generateEmbeddingsForChunkFile',
+        python_callable=task_generateEmbeddingsForChunkFile,
+        trigger_rule='none_failed_min_one_success'
+    )
+
 task_inititatePipeline >> \
     task_validateInputPDFLinks >> \
         task_downloadPDFs >> \
             task_selectPDFProcessor >> \
                 [task_processPDFViaNougat, task_processPDFViaPyPDF]
+
+task_processPDFViaPyPDF >> task_chunkingForPyPDF_MMDs
+task_processPDFViaNougat >> task_chunkingForNougat_MMDs
+
+[task_chunkingForNougat_MMDs, task_chunkingForPyPDF_MMDs] >> task_generateEmbeddingsForChunkFile
